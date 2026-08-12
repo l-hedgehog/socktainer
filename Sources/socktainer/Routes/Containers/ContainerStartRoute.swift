@@ -377,7 +377,9 @@ extension ContainerStartRoute {
 
         if let dnsServer,
             let snapshot = startedSnapshot,
-            !ClientContainerService.isDNSSidecar(snapshot)
+            !ClientContainerService.isDNSSidecar(snapshot),
+            // SocktainerDNSServer registration is gated on the frozen gateway label.
+            snapshot.configuration.labels[DNSResolutionMode.resolutionModeLabel] == nil
         {
             // Register only on a network that has a DNS forwarder sidecar — same reserved set
             // as sidecarNetwork. On reserved networks (default/bridge/host/none) there is no
@@ -439,6 +441,8 @@ extension ContainerStartRoute {
 
     static func ensureDNSSidecarBeforeStart(for container: ContainerSnapshot, req: Request) async {
         guard container.status != .running,
+            // A gateway container resolves via the vmnet gateway — no DNS sidecar needed.
+            container.configuration.labels[DNSResolutionMode.resolutionModeLabel] == nil,
             let dnsManager = req.application.storage[NetworkDNSManagerKey.self],
             let network = sidecarNetwork(
                 configuredNetworks: container.configuration.networks.map { $0.network },

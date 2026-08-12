@@ -223,7 +223,11 @@ func configure(_ app: Application) async throws {
             guard !ClientContainerService.isDNSSidecar(container)
             else { continue }
 
-            ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: app.logger)
+            // SocktainerDNSServer re-registration is gated on the frozen gateway label
+            // (still resume the healthcheck below).
+            if container.configuration.labels[DNSResolutionMode.resolutionModeLabel] == nil {
+                ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: app.logger)
+            }
 
             // Resume healthcheck loop if the container has one.
             guard let json = container.configuration.labels[HealthCheckManager.healthcheckLabel],
@@ -233,6 +237,22 @@ func configure(_ app: Application) async throws {
             await healthCheckManager.start(containerId: container.id, config: config)
             app.logger.info("Resumed healthcheck for \(container.id)")
         }
+    }
+
+    // Best-effort: without dns.domain (and a /etc/resolver/containerization.<dnsDomain> file)
+    // macOS won't route *.dnsDomain to the allocator. Warn only — opted-in networks then fall
+    // back to sidecar at create.
+    if let dnsDomain = systemConfig.dns.domain {
+        let resolverPath = "/etc/resolver/containerization.\(dnsDomain)"
+        if !FileManager.default.fileExists(atPath: resolverPath) {
+            app.logger.warning(
+                "[dns] container_name_only networks need a host resolver at \(resolverPath) routing *.\(dnsDomain) → 127.0.0.1; without it opted-in networks won't resolve host-side"
+            )
+        }
+    } else {
+        app.logger.warning(
+            "[dns] no dns.domain configured — container_name_only networks cannot be honored and will fall back to sidecar at create"
+        )
     }
 
     // Sidecar adoption and network reaping (in that order — a network whose only
