@@ -344,6 +344,34 @@ extension ContainerCreateRoute {
             let hostname = ContainerNameUtility.sanitize(
                 (body.Hostname?.isEmpty == false) ? body.Hostname! : "\(id)-\(UUID().uuidString.lowercased())")
 
+            let dnsDomain = systemConfig.dns.domain
+
+            // Resolve container_name_only per named network in one listing; skipped when
+            // dnsDomain == nil (nothing to honor — every network is effectively sidecar).
+            var networkDNS: [String: ContainerCreateRoute.NetworkDNSPolicy] = [:]
+            if dnsDomain != nil {
+                req.logger.info("[dns] listing networks to read resolution-mode labels")
+                if let resources = try? await NetworkClient().list() {
+                    let entries = resources.compactMap { resource -> (String, [String: String], String)? in
+                        let name = resource.configuration.name
+                        guard !ContainerCreateRoute.isReservedNetwork(name) else { return nil }
+                        return (name, resource.configuration.labels.dictionary, resource.status.ipv4Gateway.description)
+                    }
+                    networkDNS = ContainerCreateRoute.networkDNSPolicies(networks: entries, warn: { req.logger.warning("\($0)") })
+                    req.logger.info("[dns] read resolution-mode labels for \(networkDNS.count) named network(s)")
+                } else {
+                    req.logger.warning("[dns] could not list networks while reading resolution-mode labels; using sidecar")
+                }
+            }
+            let attachHostname: (String) -> String = { network in
+                let mode = networkDNS[network]?.mode ?? .sidecar
+                // First FQDN label per gateway mode — container_name_only uses the container name.
+                let firstLabel = ContainerCreateRoute.isGatewayFQDNMode(mode) ? CanonicalDNSName.label(id) : ""
+                return ContainerCreateRoute.gatewayHostname(
+                    fallback: hostname, firstLabel: firstLabel, network: network, dnsDomain: dnsDomain, mode: mode
+                )
+            }
+
             // Handle networking configuration from request
             if let networkingConfig = body.NetworkingConfig,
                 let endpointsConfig = networkingConfig.EndpointsConfig,
@@ -351,7 +379,7 @@ extension ContainerCreateRoute {
             {
                 // Use networking config from request if provided
                 containerConfiguration.networks = endpointsConfig.map { (networkName, _) in
-                    let options = AttachmentOptions(hostname: hostname)
+                    let options = AttachmentOptions(hostname: attachHostname(networkName))
                     return AttachmentConfiguration(network: networkName, options: options)
                 }
             } else if let networkingConfig = body.NetworkingConfig,
@@ -360,7 +388,7 @@ extension ContainerCreateRoute {
             {
                 // Fallback to Networks field for backward compatibility
                 containerConfiguration.networks = networks.map { (networkName, _) in
-                    let options = AttachmentOptions(hostname: hostname)
+                    let options = AttachmentOptions(hostname: attachHostname(networkName))
                     return AttachmentConfiguration(network: networkName, options: options)
                 }
             } else if let hostConfig = body.HostConfig,
@@ -387,11 +415,11 @@ extension ContainerCreateRoute {
                     resolvedMode = networkMode
                 }
                 containerConfiguration.networks = [
-                    AttachmentConfiguration(network: resolvedMode, options: AttachmentOptions(hostname: hostname))
+                    AttachmentConfiguration(network: resolvedMode, options: AttachmentOptions(hostname: attachHostname(resolvedMode)))
                 ]
             } else {
                 // Fall back to default network if no networking config provided
-                containerConfiguration.networks = [AttachmentConfiguration(network: "default", options: AttachmentOptions(hostname: hostname))]
+                containerConfiguration.networks = [AttachmentConfiguration(network: "default", options: AttachmentOptions(hostname: attachHostname("default")))]
             }
 
             containerConfiguration.publishedPorts = publishedPorts
@@ -462,6 +490,9 @@ extension ContainerCreateRoute {
                 endpointsConfigKeys: endpointsKeys,
                 networkMode: body.HostConfig?.NetworkMode
             )
+            // The primary (first-named) network drives the single per-container DNS config.
+            let primaryPolicy = firstNamedNetwork.flatMap { networkDNS[$0] }
+            let primaryMode = primaryPolicy?.mode ?? .sidecar
             if isHostMode {
                 // host-mode containers get loopback (127.0.0.1) as their only nameserver.
                 // Any external DNS lookup (e.g. Deno resolving registry.npmjs.org for an
@@ -475,20 +506,34 @@ extension ContainerCreateRoute {
                     searchDomains: existing?.searchDomains ?? [],
                     options: existing?.options ?? []
                 )
-            } else if let firstNetwork = firstNamedNetwork,
-                let dnsManager = req.application.storage[NetworkDNSManagerKey.self]
-            {
-                do {
-                    let dnsIP = try await dnsManager.ensureDNSContainer(networkId: firstNetwork)
-                    let existing = containerConfiguration.dns
-                    containerConfiguration.dns = ContainerConfiguration.DNSConfiguration(
-                        nameservers: [dnsIP],
-                        domain: existing?.domain,
-                        searchDomains: existing?.searchDomains ?? [],
-                        options: existing?.options ?? []
+            } else if let firstNetwork = firstNamedNetwork {
+                let existingDNS = containerConfiguration.dns
+                if ContainerCreateRoute.isGatewayFQDNMode(primaryMode), let dnsDomain = systemConfig.dns.domain {
+                    // Point guest DNS at the primary network's resolved nameservers (see NetworkDNSPolicy).
+                    containerConfiguration.dns = ContainerCreateRoute.gatewayResolutionDNS(
+                        existing: existingDNS,
+                        nameservers: primaryPolicy?.nameservers ?? [],
+                        network: firstNetwork,
+                        dnsDomain: dnsDomain
                     )
-                } catch {
-                    req.logger.warning("Could not start DNS container for \(firstNetwork): \(error)")
+                    // Freeze the effective mode so start/restart/resume skip the sidecar.
+                    containerLabels[DNSResolutionMode.resolutionModeLabel] = primaryMode.rawString
+                } else {
+                    if let dnsManager = req.application.storage[NetworkDNSManagerKey.self] {
+                        // Default sidecar branch.
+                        do {
+                            let dnsIP = try await dnsManager.ensureDNSContainer(networkId: firstNetwork)
+                            let existing = containerConfiguration.dns
+                            containerConfiguration.dns = ContainerConfiguration.DNSConfiguration(
+                                nameservers: [dnsIP],
+                                domain: existing?.domain,
+                                searchDomains: existing?.searchDomains ?? [],
+                                options: existing?.options ?? []
+                            )
+                        } catch {
+                            req.logger.warning("Could not start DNS container for \(firstNetwork): \(error)")
+                        }
+                    }
                 }
             }
             containerConfiguration.labels = containerLabels
@@ -709,6 +754,93 @@ extension ContainerCreateRoute {
         if let net = endpointsConfigKeys.first(where: { !$0.isEmpty && !reservedModes.contains($0) }) { return net }
         if let mode = networkMode, !mode.isEmpty, !reservedModes.contains(mode) { return mode }
         return nil
+    }
+
+    /// Whether this network is a reserved, non-routable Docker mode (default/bridge/host/none).
+    static func isReservedNetwork(_ network: String) -> Bool {
+        ["default", "bridge", "host", "none"].contains(network)
+    }
+
+    /// A network's effective resolution mode from its operator label: absent/invalid → `sidecar`
+    /// (the default), an invalid value also warns.
+    static func effectiveResolutionMode(labelValue: String?, warn: (String) -> Void) -> DNSResolutionMode {
+        guard let labelValue, !labelValue.isEmpty else { return .sidecar }
+        if let mode = DNSResolutionMode(rawString: labelValue) { return mode }
+        warn("warning: unknown DNS resolution-mode label value '\(labelValue)', falling back to sidecar")
+        return .sidecar
+    }
+
+    /// A network's DNS policy: its effective mode (operator label, `sidecar` when absent/invalid)
+    /// and nameservers — the gateway, or `[]` (missing/`0.0.0.0`) so apple/container substitutes
+    /// the vmnet gateway.
+    struct NetworkDNSPolicy {
+        let mode: DNSResolutionMode
+        let nameservers: [String]
+    }
+
+    /// Maps each network's labels + gateway to a policy: label→mode, gateway→nameservers
+    /// (`[]` for empty/`0.0.0.0`, see `NetworkDNSPolicy`).
+    static func networkDNSPolicies(
+        networks: [(name: String, labels: [String: String], gateway: String)],
+        warn: (String) -> Void
+    ) -> [String: NetworkDNSPolicy] {
+        var result: [String: NetworkDNSPolicy] = [:]
+        for entry in networks {
+            result[entry.name] = NetworkDNSPolicy(
+                mode: ContainerCreateRoute.effectiveResolutionMode(
+                    labelValue: entry.labels[DNSResolutionMode.resolutionModeLabel], warn: warn
+                ),
+                nameservers: (entry.gateway.isEmpty || entry.gateway == "0.0.0.0") ? [] : [entry.gateway]
+            )
+        }
+        return result
+    }
+
+    /// Whether a mode resolves names via a gateway FQDN (rather than the sidecar).
+    static func isGatewayFQDNMode(_ mode: DNSResolutionMode) -> Bool {
+        mode == .containerNameOnly
+    }
+
+    /// The per-attachment hostname for a gateway-FQDN mode: the caller-supplied first label
+    /// turned into an `{label}.{net}.{dnsDomain}` FQDN on a named network with a configured dns
+    /// domain, else the plain fallback (reserved networks, sidecar, or no dns domain).
+    static func gatewayHostname(
+        fallback: String,
+        firstLabel: String,
+        network: String,
+        dnsDomain: String?,
+        mode: DNSResolutionMode
+    ) -> String {
+        guard isGatewayFQDNMode(mode), let dnsDomain, !isReservedNetwork(network) else { return fallback }
+        return CanonicalDNSName.fqdn(
+            label: firstLabel,
+            network: CanonicalDNSName.normalizedNetwork(network),
+            dnsDomain: dnsDomain
+        )
+    }
+
+    /// The resolv.conf for a gateway-FQDN container: search gets `[net.dnsDomain, dnsDomain]` appended,
+    /// options get `ndots` = max(user, 2), and domain falls back to the dns domain when unset.
+    static func gatewayResolutionDNS(
+        existing: ContainerConfiguration.DNSConfiguration?,
+        nameservers: [String],
+        network: String,
+        dnsDomain: String
+    ) -> ContainerConfiguration.DNSConfiguration {
+        let net = CanonicalDNSName.normalizedNetwork(network)
+        var search = existing?.searchDomains ?? []
+        for sd in CanonicalDNSName.searchDomains(network: net, dnsDomain: dnsDomain) where !search.contains(sd) {
+            search.append(sd)
+        }
+        let options =
+            (existing?.options ?? []).filter { !$0.lowercased().hasPrefix("ndots:") }
+            + [CanonicalDNSName.ndots(from: existing?.options ?? [])]
+        return ContainerConfiguration.DNSConfiguration(
+            nameservers: nameservers,
+            domain: existing?.domain ?? dnsDomain,
+            searchDomains: search,
+            options: options
+        )
     }
 
     /// Maps an error from the pre-flight image existence check to a client-facing error.
