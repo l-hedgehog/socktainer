@@ -23,6 +23,7 @@
     - [GitHub Releases](#github-releases)
   - [Usage 🚀](#usage-🚀)
     - [Volume sync mode](#volume-sync-mode)
+    - [DNS resolution mode](#dns-resolution-mode)
     - [VM memory](#vm-memory)
     - [Volume compatibility — Postgres](#volume-compatibility--postgres)
   - [Building from Source 🏗️](#building-from-source-🏗️)
@@ -212,6 +213,20 @@ volumes:
 ```
 
 Valid modes: `nosync` · `fsync` · `full`
+
+### DNS resolution mode
+
+Opt in per network by creating it with a label; socktainer registers each attached
+container's `{name}.{network}.{dnsDomain}` FQDN, resolved as
+`guest → vmnet gateway → Apple's allocator :2053`:
+
+```bash
+docker network create --label l-hedgehog.dns.resolution-mode=container_name_only mynet
+```
+
+Requires a host `/etc/resolver/containerization.<dnsDomain>` file (so macOS routes
+`*.dnsDomain` to :2053) and a configured `dns.domain` — see [apple/container's local DNS setup](https://github.com/apple/container/blob/main/docs/tutorials/start-here.md#set-up-a-local-dns-domain-optional).
+Socktainer warns on startup if either is missing.
 
 ### VM memory
 
